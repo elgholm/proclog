@@ -1,0 +1,144 @@
+#!/bin/bash
+
+# Yes, I know about sa, pminfo/pmrep, auditd, etc. But they don't show me what I want to see,
+# or I just don't understand them well enough. This I understand.
+# Tip: When running from cron, set the environment variable RUN_BY_CRON to some value.
+# cron Example: * * * * * export RUN_BY_CRON=Y; /root/scripts/proclog 3 3 email@address.net
+# - Charlie Elgholm 2023-04-14
+
+VERSION=1.0
+PFOLDER=/tmp/proclog
+LOADAVG_FIELD=1
+IF_LOADAVG_GTE=$1
+ITERATIONS=${2:-5}
+SLEEP=5
+SEND_EMAIL=$3
+FROM_EMAIL=proclog@elgholm.se
+SMTP_SERVER=smtp.server.net:25
+
+top_cmd="top -bcn1 -w512"
+ps_cmd="ps -ax -o pid,ppid,stat,pcpu,psr,pmem,user,comm,wchan:30,args --sort -pcpu"
+iotop_cmd="/usr/sbin/iotop -b -o -t -n 3"
+iostat_cmd="iostat -x 1 4"
+
+# Usage?
+if [ $# -lt 1 ]; then
+	cat <<EOF
+$0:
+	Script to collect various process information about what's running on the system at the called moment.
+	Information is saved under the $PFOLDER directory, e.g. $PFOLDER/$(date +%Y-%m-%d)/$(date +%H%M%S).txt
+Usage:
+	$0 2 3 email@address.net
+	2 = Only run if 1-min load average is greater than or equal to 2.
+	3 = Run 3 iterations (default 5).
+	email@address.net = Send email to email@address.net (default "" = no email)
+
+	Please see the script for more information and all settings.
+EOF
+	exit 1
+fi
+
+# Should we execute?
+LOADAVG=$(cut -f $LOADAVG_FIELD -d " " /proc/loadavg)
+if (( $(echo "$LOADAVG < $IF_LOADAVG_GTE" | bc) )); then
+	exit 0
+fi
+
+# Make sure we're just running one instance of this script at a time
+LOCKFILE=/tmp/running_proclog_pid
+if [ -f $LOCKFILE ]; then
+        echo "proclog already running as pid $(cat $LOCKFILE), exiting. ($LOCKFILE)"
+        exit 1
+fi
+echo "$$" >$LOCKFILE
+
+FOLDER=$PFOLDER/$(date +%Y-%m-%d)
+FILE=$FOLDER/$(date +%H%M%S).txt
+
+function send_wakeup_email()
+{
+        if [ ! -z "$SEND_EMAIL" ]; then
+		echo "proclog wakeup, current loadavg $(cat /proc/loadavg), file $FILE" | mailx -r "$FROM_EMAIL" -s "proclog wakeup, loadavg $LOADAVG" -S smtp="$SMTP_SERVER" $SEND_EMAIL
+        fi
+}
+
+function send_email()
+{
+	if [ ! -z "$SEND_EMAIL" ]; then
+		inf "Sending email to $SEND_EMAIL..."
+		echo "proclog done, current loadavg $(cat /proc/loadavg), file $FILE attached." | mailx -a $FILE -r "$FROM_EMAIL" -s "proclog done for loadavg $LOADAVG" -S smtp="$SMTP_SERVER" $SEND_EMAIL
+	fi
+}
+
+function inf()
+{
+	if [ -z "$RUN_BY_CRON" ]; then
+                echo "$1"
+        fi
+}
+
+function header()
+{
+	inf "$1"
+	echo -e "\n\n" >>$FILE
+	echo "--- $1 - $(date) ---" >>$FILE
+	echo >>$FILE
+}
+
+# Create folder
+mkdir -p $FOLDER
+
+# Start new file
+echo "proclog v$VERSION - $(hostname)" >$FILE
+
+function do_top()
+{
+	header "top"
+	$top_cmd | head -n 75 >>$FILE
+}
+
+send_wakeup_email
+
+for (( c=1; c<=$ITERATIONS; c++ ))
+do
+	if [ $c -gt 1 ]; then
+		inf "(Sleeping for $SLEEP seconds...)"
+		sleep $SLEEP
+	fi
+	inf "--- Iteration $c/$ITERATIONS ---"
+
+	# Do tests
+
+	do_top
+
+	header "ps"
+	$ps_cmd | head -n 50 >>$FILE
+	header "ps D states"
+	$ps_cmd | grep " D" >>$FILE
+
+	do_top
+
+	header "iotop"
+	$iotop_cmd >>$FILE
+
+	do_top
+
+	header "iostat"
+	$iostat_cmd >>$FILE
+
+	do_top
+done
+
+header "cron"
+tail -n 25 /var/log/cron >>$FILE
+
+header "messages"
+tail -n 100 /var/log/messages >>$FILE
+
+date >>$FILE
+
+rm -f $LOCKFILE
+
+# Send mail?
+send_email
+
