@@ -28,7 +28,7 @@ Run this from systemd using this service file:
 Description=proclog daemon
 
 [Service]
-ExecStart=/root/scripts/proclog 2 3 charlie@brightly.se yes
+ExecStart=/root/scripts/proclog 2 3 email@address.net yes
 ExecStop=/usr/bin/rm -f /var/log/proclog/dpid
 Restart=on-failure
 
@@ -41,5 +41,5 @@ When running from cron, set the environment variable RUN_BY_CRON to some value:
 * * * * * export RUN_BY_CRON=Y; /root/scripts/proclog 3 3 email@address.net
 ```
 
-Cheers!
+Cheers!  
 /Charlie Elgholm 2023-04-25
