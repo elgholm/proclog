@@ -2,63 +2,73 @@
 
 # Yes, I know about sa, pminfo/pmrep, auditd, etc. But they don't show me what I want to see,
 # or I just don't understand them well enough. This I understand.
+# Run this via systemd (as a daemon) or from cron.
 # Tip: When running from cron, set the environment variable RUN_BY_CRON to some value.
 # cron Example: * * * * * export RUN_BY_CRON=Y; /root/scripts/proclog 3 3 email@address.net
 # - Charlie Elgholm 2023-04-14
 
-VERSION=1.0
-PFOLDER=/tmp/proclog
-LOADAVG_FIELD=1
+# This version
+VERSION=1.1
+
+# Do checks if load average gte than..
 IF_LOADAVG_GTE=$1
-ITERATIONS=${2:-5}
-SLEEP=5
+
+# Iterations on each wakeup (default 3)
+ITERATIONS=${2:-3}
+
+# Send email to (if any)
 SEND_EMAIL=$3
-FROM_EMAIL=proclog@elgholm.se
+
+# Run as daemon?
+DAEMON=$4
+
+# Where to put logfiles
+LOGFOLDER=/var/log/proclog
+
+# The load average field to check (1)
+LOADAVG_FIELD=1
+
+# How long to sleep between each wakeup-check, if running as a daemon (30)
+WAKEUP=30
+
+# How long to sleep between iterations (1)
+SLEEP=1
+
+# From email (name@domain.net)
+FROM_EMAIL=name@domain.net
+
+# SMTP server to send mail to, mailx used, see below (hostname[:port])
 SMTP_SERVER=smtp.server.net:25
 
+# Commands with arguments
 top_cmd="top -bcn1 -w512"
 ps_cmd="ps -ax -o pid,ppid,stat,pcpu,psr,pmem,user,comm,wchan:30,args --sort -pcpu"
 iotop_cmd="/usr/sbin/iotop -b -o -t -n 3"
 iostat_cmd="iostat -x 1 4"
+vmstat_cmd="vmstat -SM 1 4"
 
-# Usage?
-if [ $# -lt 1 ]; then
+function usage()
+{
 	cat <<EOF
 $0:
-	Script to collect various process information about what's running on the system at the called moment.
-	Information is saved under the $PFOLDER directory, e.g. $PFOLDER/$(date +%Y-%m-%d)/$(date +%H%M%S).txt
+        Script to collect various process information about what's running on the system at the called moment.
+        Information is saved under the $LOGFOLDER directory, e.g. $LOGFOLDER/$(date +%Y-%m-%d)/$(date +%H%M%S).txt
+        Version $VERSION
 Usage:
-	$0 2 3 email@address.net
-	2 = Only run if 1-min load average is greater than or equal to 2.
-	3 = Run 3 iterations (default 5).
-	email@address.net = Send email to email@address.net (default "" = no email)
+        $0 2 3 email@address.net [daemon]
+        2 = Only run if 1-min load average is greater than or equal to 2.
+        3 = Run 3 iterations (default 3).
+        email@address.net = Send email to email@address.net (default "" = no email)
+        daemon = run as a daemon (exits when $LOGFOLDER/dpid is removed)
 
-	Please see the script for more information and all settings.
+        Please see the script for more information and all settings.
 EOF
-	exit 1
-fi
-
-# Should we execute?
-LOADAVG=$(cut -f $LOADAVG_FIELD -d " " /proc/loadavg)
-if (( $(echo "$LOADAVG < $IF_LOADAVG_GTE" | bc) )); then
-	exit 0
-fi
-
-# Make sure we're just running one instance of this script at a time
-LOCKFILE=/tmp/running_proclog_pid
-if [ -f $LOCKFILE ]; then
-        echo "proclog already running as pid $(cat $LOCKFILE), exiting. ($LOCKFILE)"
-        exit 1
-fi
-echo "$$" >$LOCKFILE
-
-FOLDER=$PFOLDER/$(date +%Y-%m-%d)
-FILE=$FOLDER/$(date +%H%M%S).txt
+}
 
 function send_wakeup_email()
 {
         if [ ! -z "$SEND_EMAIL" ]; then
-		echo "proclog wakeup, current loadavg $(cat /proc/loadavg), file $FILE" | mailx -r "$FROM_EMAIL" -s "proclog wakeup, loadavg $LOADAVG" -S smtp="$SMTP_SERVER" $SEND_EMAIL
+			echo "proclog wakeup, current loadavg $(cat /proc/loadavg), file $FILE" | mailx -r "$FROM_EMAIL" -s "proclog $HOSTNAME wakeup, loadavg $LOADAVG" -S smtp="$SMTP_SERVER" $SEND_EMAIL
         fi
 }
 
@@ -66,79 +76,134 @@ function send_email()
 {
 	if [ ! -z "$SEND_EMAIL" ]; then
 		inf "Sending email to $SEND_EMAIL..."
-		echo "proclog done, current loadavg $(cat /proc/loadavg), file $FILE attached." | mailx -a $FILE -r "$FROM_EMAIL" -s "proclog done for loadavg $LOADAVG" -S smtp="$SMTP_SERVER" $SEND_EMAIL
+		echo "proclog done, current loadavg $(cat /proc/loadavg), file $FILE attached." | mailx -a $FILE.txt -r "$FROM_EMAIL" -s "proclog $HOSTNAME done for loadavg $LOADAVG" -S smtp="$SMTP_SERVER" $SEND_EMAIL
 	fi
 }
 
 function inf()
 {
 	if [ -z "$RUN_BY_CRON" ]; then
-                echo "$1"
-        fi
+		echo "$1"
+	fi
 }
 
 function header()
 {
 	inf "$1"
-	echo -e "\n\n" >>$FILE
-	echo "--- $1 - $(date) ---" >>$FILE
-	echo >>$FILE
+	echo -e "\n\n" >>$FILE.$2
+	echo "--- $1 - $(date) ---" >>$FILE.$2
+	echo >>$FILE.$2
 }
 
-# Create folder
-mkdir -p $FOLDER
-
-# Start new file
-echo "proclog v$VERSION - $(hostname)" >$FILE
-
-function do_top()
+function dochecks()
 {
-	header "top"
-	$top_cmd | head -n 75 >>$FILE
+	# Should we execute?
+	LOADAVG=$(cut -f $LOADAVG_FIELD -d " " /proc/loadavg)
+	if (( $(echo "$LOADAVG < $IF_LOADAVG_GTE" | bc) )); then
+		return 0
+	fi
+
+	# Make sure we're just running one instance of this script at a time
+	if [ -f $PIDFILE ]; then
+		echo "proclog already running as pid $(cat $PIDFILE), exiting. ($PIDFILE)"
+		exit 1
+	fi
+	echo "$$" >$PIDFILE
+
+	FOLDER=$LOGFOLDER/$(date +%Y-%m-%d)
+	FILE=$FOLDER/$(date +%H%M%S)
+	mkdir -p $FOLDER
+
+	# Start new file
+	echo "proclog v$VERSION - $HOSTNAME" >$FILE.txt
+
+	send_wakeup_email
+
+	for (( c=1; c<=$ITERATIONS; c++ ))
+	do
+		if [ $c -gt 1 ]; then
+			inf "(Sleeping for $SLEEP seconds...)"
+			sleep $SLEEP
+		fi
+		inf "--- Iteration $c/$ITERATIONS ---"
+
+		# Set the exit status $? to the exit code of the last program to exit non-zero
+		set -o pipefail
+		pids=""
+
+		# Do tests
+		
+		header "top" tmp.1
+		$top_cmd | head -n 75 >>$FILE.tmp.1 &
+		pids+="$! "
+
+		header "vmstat" tmp.2
+		$vmstat_cmd >>$FILE.tmp.2 &
+		pids+="$! "
+
+		header "ps D states" tmp.3
+		$ps_cmd | grep " D" >>$FILE.tmp.3 &
+		pids+="$! "
+
+		header "ps" tmp.4
+		$ps_cmd | head -n 50 >>$FILE.tmp.4 &
+		pids+="$! "
+		
+		header "iotop" tmp.5
+		$iotop_cmd >>$FILE.tmp.5 &
+		pids+="$! "
+
+		header "iostat" tmp.6
+		$iostat_cmd >>$FILE.tmp.6 &
+		pids+="$! "
+		
+		for pid in $pids; do
+			wait $pid
+			rc=$?
+			if [ ! $rc -eq 0 ]; then
+				echo "FAILED: pid $pid exited with status $rc"
+			fi
+		done
+	done
+	
+	# Join files
+	cat $FILE.tmp.* >>$FILE.txt
+	rm $FILE.tmp.*
+
+	header "cron" txt
+	tail -n 25 /var/log/cron >>$FILE.txt
+
+	header "messages" txt
+	tail -n 100 /var/log/messages >>$FILE.txt
+	
+	rm -f $PIDFILE
+
+	# Send mail?
+	send_email
 }
 
-send_wakeup_email
+# Usage?
+if [ $# -lt 1 ]; then
+	usage
+	exit 1
+fi
 
-for (( c=1; c<=$ITERATIONS; c++ ))
-do
-	if [ $c -gt 1 ]; then
-		inf "(Sleeping for $SLEEP seconds...)"
-		sleep $SLEEP
-	fi
-	inf "--- Iteration $c/$ITERATIONS ---"
+# Setup
+mkdir -p $LOGFOLDER
+PIDFILE=$LOGFOLDER/pid
+DPIDFILE=$LOGFOLDER/dpid
+HOSTNAME=$(hostname)
 
-	# Do tests
-
-	do_top
-
-	header "ps"
-	$ps_cmd | head -n 50 >>$FILE
-	header "ps D states"
-	$ps_cmd | grep " D" >>$FILE
-
-	do_top
-
-	header "iotop"
-	$iotop_cmd >>$FILE
-
-	do_top
-
-	header "iostat"
-	$iostat_cmd >>$FILE
-
-	do_top
-done
-
-header "cron"
-tail -n 25 /var/log/cron >>$FILE
-
-header "messages"
-tail -n 100 /var/log/messages >>$FILE
-
-date >>$FILE
-
-rm -f $LOCKFILE
-
-# Send mail?
-send_email
-
+if [ ! -z "$DAEMON" ]; then
+	# Start monitoring as a daemon
+	echo "$$" >$DPIDFILE
+	while true; do
+		dochecks
+		sleep $WAKEUP
+		if [ ! -f $DPIDFILE ]; then
+			exit 0;
+		fi
+	done
+else
+	dochecks
+fi
