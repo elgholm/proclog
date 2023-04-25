@@ -1,7 +1,7 @@
 proclog
 
-Script to collect various process information about what's running on the system at the called moment.
-Information is saved under the /var/log/proclog directory, e.g. /var/log/proclog/2023-04-25/121314.txt
+Script to collect various process information about what's running on the system at the called moment.  
+Information is saved under the /var/log/proclog directory, e.g. /var/log/proclog/2023-04-25/121314.txt  
 Version 1.1
 
 Usage:
